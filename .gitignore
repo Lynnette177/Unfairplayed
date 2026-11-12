@@ -1,0 +1,24 @@
+.DS_Store
+.unfairplayed.env
+.unfairplayed.env.*
+!.unfairplayed.env.example
+iOS/build/
+iOS/payload/
+iOS/out/
+iOS/debug-signing-build/
+*.ipa
+xcuserdata/
+desktop/build/
+__pycache__/
+.unfairplayed.lock
+*.log
+*.mobileprovision
+*.p12
+*.p8
+
+# Public artifacts are generated only from the audited allowlist.
+desktop/dist/
+*.pfx
+*.key
+*.pem
+*.provisionprofile

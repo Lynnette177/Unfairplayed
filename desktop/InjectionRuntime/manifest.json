@@ -1,0 +1,9 @@
+{
+  "upstream": "https://github.com/EamonTracey/iPatch",
+  "commit": "61e9d82cd4e6af4526a686c7d780d758377a6e4c",
+  "libraries": {
+    "libblackjack.dylib": "b4405a500a47983ee89d51d81349655d5f99295ff92092ee8f306673acd9e1d7",
+    "libhooker.dylib": "854571b8277ae12922b18f5cc08a3db87ba9bf5546f5730b3ada6c7d40091838",
+    "libsubstrate.dylib": "ddb437812d23e898de98ac7692d59edfb667d625a4663b619e6e9efe31e06e82"
+  }
+}
