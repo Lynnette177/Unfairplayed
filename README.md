@@ -271,5 +271,6 @@ python3 -m pip install frida-tools
 - [Frida](https://frida.re/) — 动态插桩工具与 Gadget。
 
 This product includes software developed by CoolStar.
+同名帖子已发布在Linux Do社区
 
 [上游原始说明](docs/UPSTREAM.md) · [运行库许可证与来源](desktop/InjectionRuntime/README.md) · [图标资源](desktop/Assets/README.md)
