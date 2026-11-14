@@ -265,6 +265,127 @@ static bool data_only_plaintext_valid(int fd, const fp_slice_t *s, const uint8_t
 
 #pragma mark - attempt
 
+
+// A small function may return by tail-calling an imported routine (for example
+// objc_autoreleaseReturnValue) and contain no RET at all. Recognize a bounded
+// stack-restoring epilogue followed by a branch to a real arm64 import stub.
+// This is checked only against the successfully read, remapped bytes.
+static bool tail_call_plaintext_valid(int fd, const fp_slice_t *s, const uint8_t *plain) {
+    if (!plain || !s->cryptsize || s->cryptsize > 1024 * 1024 ||
+        s->cryptoff > s->slice_size || s->cryptsize > s->slice_size - s->cryptoff) return false;
+    struct mach_header_64 mh;
+    if (s->slice_size < sizeof mh || !pread_full(fd, &mh, sizeof mh, s->slice_off) ||
+        mh.magic != MH_MAGIC_64 || mh.cputype != CPU_TYPE_ARM64 ||
+        mh.sizeofcmds > 16 * 1024 * 1024 || mh.sizeofcmds > s->slice_size - sizeof mh) return false;
+    uint8_t *commands = malloc(mh.sizeofcmds);
+    if (!commands || !pread_full(fd, commands, mh.sizeofcmds, s->slice_off + sizeof mh)) {
+        free(commands); return false;
+    }
+    struct section_64 text = {0}, stubs = {0}, pointers[32];
+    uint32_t pointer_count = 0;
+    uint32_t pos = 0; bool valid = true;
+    for (uint32_t i = 0; i < mh.ncmds && valid; i++) {
+        if (pos > mh.sizeofcmds || mh.sizeofcmds - pos < sizeof(struct load_command)) { valid = false; break; }
+        const struct load_command *lc = (const void *)(commands + pos);
+        if (lc->cmdsize < sizeof *lc || lc->cmdsize > mh.sizeofcmds - pos) { valid = false; break; }
+        if (lc->cmd == LC_SEGMENT_64) {
+            if (lc->cmdsize < sizeof(struct segment_command_64)) { valid = false; break; }
+            const struct segment_command_64 *segment = (const void *)lc;
+            if (segment->nsects > (lc->cmdsize - sizeof *segment) / sizeof(struct section_64)) { valid = false; break; }
+            const struct section_64 *sections = (const void *)(segment + 1);
+            for (uint32_t j = 0; j < segment->nsects; j++) {
+                const struct section_64 *v = &sections[j];
+                uint32_t type = v->flags & SECTION_TYPE;
+                if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
+                    if (pointer_count == 32 || v->offset > s->slice_size || v->size > s->slice_size - v->offset ||
+                        v->addr > UINT64_MAX - v->size) { valid = false; break; }
+                    pointers[pointer_count++] = *v;
+                }
+                if (strncmp(v->segname, "__TEXT", 16) || strncmp(segment->segname, "__TEXT", 16)) continue;
+                if (!strncmp(v->sectname, "__text", 16)) {
+                    if (text.size) { valid = false; break; }
+                    text = *v;
+                } else if (!strncmp(v->sectname, "__stubs", 16)) {
+                    if (stubs.size) { valid = false; break; }
+                    stubs = *v;
+                }
+            }
+        }
+        pos += lc->cmdsize;
+    }
+    free(commands);
+    uint64_t end = (uint64_t)s->cryptoff + s->cryptsize;
+    if (!valid || pos != mh.sizeofcmds || text.size < 12 || stubs.size < 12 ||
+        (text.flags & SECTION_TYPE) != S_REGULAR || !(text.flags & S_ATTR_PURE_INSTRUCTIONS) ||
+        (stubs.flags & SECTION_TYPE) != S_SYMBOL_STUBS || stubs.reserved2 != 12 ||
+        text.offset < s->cryptoff || text.offset > end || text.size > end - text.offset ||
+        stubs.offset < s->cryptoff || stubs.offset > end || stubs.size > end - stubs.offset ||
+        text.offset % 4 || text.size % 4 || stubs.offset % 4 || stubs.size % 12 ||
+        text.addr > UINT64_MAX - text.size || stubs.addr > UINT64_MAX - stubs.size ||
+        !(text.offset + text.size <= stubs.offset || stubs.offset + stubs.size <= text.offset) ||
+        !(text.addr + text.size <= stubs.addr || stubs.addr + stubs.size <= text.addr)) return false;
+    const uint8_t *code = plain + text.offset - s->cryptoff;
+    for (uint64_t offset = 8; offset < text.size; offset += 4) {
+        uint32_t branch, add;
+        memcpy(&branch, code + offset, 4); memcpy(&add, code + offset - 4, 4);
+        if ((branch & 0xfc000000) != 0x14000000 || // B, not BL
+            (add & 0xffc003ff) != 0x910003ff) continue; // ADD SP, SP, #imm (unshifted)
+        uint32_t stack = (add >> 10) & 0xfff;
+        if (!stack || stack > 1024 || stack % 16) continue;
+        int64_t displacement = (int64_t)(branch & 0x03ffffff);
+        if (displacement & 0x02000000) displacement -= 0x04000000;
+        displacement *= 4;
+        uint64_t pc = text.addr + offset;
+        if ((displacement < 0 && pc < (uint64_t)-displacement) ||
+            (displacement >= 0 && pc > UINT64_MAX - (uint64_t)displacement)) continue;
+        uint64_t target = displacement < 0 ? pc - (uint64_t)-displacement : pc + (uint64_t)displacement;
+        if (target < stubs.addr || target - stubs.addr > stubs.size - 12 || (target - stubs.addr) % 12) continue;
+        const uint8_t *stub = plain + stubs.offset - s->cryptoff + target - stubs.addr;
+        uint32_t adrp, ldr, br;
+        memcpy(&adrp, stub, 4); memcpy(&ldr, stub + 4, 4); memcpy(&br, stub + 8, 4);
+        if (br != 0xd61f0200) continue; // BR X16
+        uint64_t pointer_pc; int64_t pointer_delta;
+        if ((adrp & 0x9f00001f) == 0x90000010 && (ldr & 0xffc003ff) == 0xf9400210) {
+            // ADRP X16; LDR X16, [X16, #imm]; BR X16.
+            pointer_pc = target & ~UINT64_C(4095);
+            pointer_delta = ((int64_t)((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
+            if (pointer_delta & 0x100000) pointer_delta -= 0x200000;
+            pointer_delta = pointer_delta * 4096 + ((ldr >> 10) & 0xfff) * 8;
+        } else if (adrp == 0xd503201f && (ldr & 0xff00001f) == 0x58000010) {
+            // Linker-relaxed stub: NOP; LDR X16, literal; BR X16.
+            if (target > UINT64_MAX - 4) continue;
+            pointer_pc = target + 4;
+            pointer_delta = (ldr >> 5) & 0x7ffff;
+            if (pointer_delta & 0x40000) pointer_delta -= 0x80000;
+            pointer_delta *= 4;
+        } else continue;
+        if ((pointer_delta < 0 && pointer_pc < (uint64_t)-pointer_delta) ||
+            (pointer_delta >= 0 && pointer_pc > UINT64_MAX - (uint64_t)pointer_delta)) continue;
+        uint64_t pointer = pointer_delta < 0 ? pointer_pc - (uint64_t)-pointer_delta : pointer_pc + (uint64_t)pointer_delta;
+        bool imported_pointer = false;
+        for (uint32_t i = 0; i < pointer_count; i++) {
+            const struct section_64 *v = &pointers[i];
+            if (v->size >= 8 && pointer >= v->addr && pointer - v->addr <= v->size - 8 &&
+                pointer % 8 == 0 && (pointer - v->addr) % 8 == 0) imported_pointer = true;
+        }
+        if (!imported_pointer) continue;
+        uint8_t restored[128] = {0};
+        for (uint64_t distance = 8; distance <= 48 && distance <= offset; distance += 4) {
+            uint32_t word; memcpy(&word, code + offset - distance, 4);
+            bool gp = (word & 0xffc003e0) == 0xa94003e0; // LDP Xt, Xt2, [SP, #offset]
+            bool fp = (word & 0xffc003e0) == 0x6d4003e0; // LDP Dt, Dt2, [SP, #offset]
+            uint32_t r1 = word & 31, r2 = (word >> 10) & 31, slot = (word >> 15) & 127;
+            if ((!gp && !fp) || (slot & 64) || slot * 8 + 16 > stack ||
+                restored[slot] || restored[slot + 1] || r1 == r2) break;
+            restored[slot] = restored[slot + 1] = 1;
+            if (gp && r1 == 29 && r2 == 30) return true;
+            if (gp ? (r1 < 19 || r1 > 28 || r2 < 19 || r2 > 28) :
+                     (r1 < 8 || r1 > 15 || r2 < 8 || r2 > 15)) break;
+        }
+    }
+    return false;
+}
+
 int fp_attempt(const char *path, const fp_slice_t *s, int mode, bool addsigs, uint8_t *out, fp_attempt_t *res) {
     memset(res, 0, sizeof *res);
     res->mode = mode; res->addsigs = addsigs; res->mremap_ret = -1;
@@ -324,6 +445,7 @@ int fp_attempt(const char *path, const fp_slice_t *s, int mode, bool addsigs, ui
         if (res->pages_ok == res->pages_total && res->changed &&
             res->ret_after <= res->ret_before && res->ent_after < 7.5) {
             res->data_only_layout = data_only_plaintext_valid(fd, s, dec);
+            res->tail_call_layout = tail_call_plaintext_valid(fd, s, dec);
         }
     }
     free(orig);
@@ -337,23 +459,24 @@ int fp_attempt(const char *path, const fp_slice_t *s, int mode, bool addsigs, ui
 void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
     snprintf(buf, len,
              "%s%s: sig=%s mmap=%s mremap=%d(errno %d %s) pages=%llu/%llu firstfail=kr%d@0x%llx changed=%d "
-             "code-words %u->%u entropy %.3f->%.3f data-only=%d (%.0f ms)",
+             "code-words %u->%u entropy %.3f->%.3f data-only=%d tail-call=%d (%.0f ms)",
              fp_mode_name(a->mode), a->addsigs ? "+sigs" : "",
              a->addsigs ? (a->sig_errno ? strerror(a->sig_errno) : "ok") : "-",
              a->mmap_errno ? strerror(a->mmap_errno) : "ok",
              a->mremap_ret, a->mremap_errno, a->mremap_errno ? strerror(a->mremap_errno) : "ok",
              (unsigned long long)a->pages_ok, (unsigned long long)a->pages_total,
              a->first_fail_kr, (unsigned long long)a->first_fail_off, a->changed,
-             a->ret_before, a->ret_after, a->ent_before, a->ent_after, a->data_only_layout, a->ms);
+             a->ret_before, a->ret_after, a->ent_before, a->ent_after, a->data_only_layout, a->tail_call_layout, a->ms);
 }
 
 static bool attempt_looks_decrypted(const fp_attempt_t *a) {
     // Instruction counting is a heuristic, not a requirement for data-only text.
     // Both branches still require successful remapping, complete reads and a
-    // changed low-entropy result; the fallback additionally validates the layout.
+    // changed low-entropy result; the fallbacks additionally validate data layout
+    // or a stack-restoring tail call into an import stub.
     return a->mremap_ret == 0 && a->pages_total > 0 && a->pages_ok == a->pages_total && a->changed &&
            a->ent_before > 7.9 && a->ent_after < 7.5 &&
-           (a->ret_after > a->ret_before || a->data_only_layout);
+           (a->ret_after > a->ret_before || a->data_only_layout || a->tail_call_layout);
 }
 
 int fp_probe_file(const char *path, const int *modes, int nmodes, fp_log_t log, void *ctx) {
@@ -396,13 +519,67 @@ static int copy_file(const char *src, const char *dst) {
     return rc;
 }
 
+
+// 32-bit iOS slices are not executed on supported devices and are deliberately
+// not passed to the arm64 decryptor. Remove them from the exported copy so they
+// cannot remain as encrypted architectures in an otherwise successful IPA.
+static int drop_32bit_slices(const char *path, fp_log_t log, void *ctx) {
+    int fd=open(path,O_RDWR); if(fd<0) return -1;
+    uint32_t magic=0; struct stat st;
+    if(fstat(fd,&st)!=0 || !pread_full(fd,&magic,4,0)) { close(fd); return -1; }
+    if(magic!=FAT_CIGAM && magic!=FAT_CIGAM_64) { close(fd); return 0; }
+    bool wide=magic==FAT_CIGAM_64; struct fat_header header;
+    if(!pread_full(fd,&header,sizeof header,0)) { close(fd); return -1; }
+    uint32_t count=OSSwapBigToHostInt32(header.nfat_arch);
+    size_t entry_size=wide?sizeof(struct fat_arch_64):sizeof(struct fat_arch);
+    if(!count || count>FP_MAX_SLICES || st.st_size<0 ||
+       sizeof header+(uint64_t)count*entry_size>(uint64_t)st.st_size) { close(fd); return -1; }
+    uint8_t entries[FP_MAX_SLICES*sizeof(struct fat_arch_64)]={0};
+    if(!pread_full(fd,entries,count*entry_size,sizeof header)) { close(fd); return -1; }
+    uint32_t kept=0; uint64_t first_offset=0,first_size=0;
+    for(uint32_t i=0;i<count;i++) {
+        uint8_t *entry=entries+i*entry_size; uint32_t cpu; uint64_t offset,size;
+        if(wide) { struct fat_arch_64 v; memcpy(&v,entry,sizeof v); cpu=OSSwapBigToHostInt32(v.cputype);offset=OSSwapBigToHostInt64(v.offset);size=OSSwapBigToHostInt64(v.size); }
+        else { struct fat_arch v; memcpy(&v,entry,sizeof v);cpu=OSSwapBigToHostInt32(v.cputype);offset=OSSwapBigToHostInt32(v.offset);size=OSSwapBigToHostInt32(v.size); }
+        if(offset<sizeof header+(uint64_t)count*entry_size || offset>(uint64_t)st.st_size ||
+           !size || size>(uint64_t)st.st_size-offset) { close(fd); return -1; }
+        if(!(cpu&CPU_ARCH_ABI64)) continue;
+        struct mach_header_64 mh;
+        if(size<sizeof mh || !pread_full(fd,&mh,sizeof mh,offset) || mh.magic!=MH_MAGIC_64 ||
+           (uint32_t)mh.cputype!=cpu) { close(fd);return -1; }
+        if(!kept) { first_offset=offset;first_size=size; }
+        memmove(entries+kept*entry_size,entry,entry_size); kept++;
+    }
+    if(kept==count) { close(fd);return 0; }
+    if(!kept) { close(fd);return -1; }
+    int rc=0;
+    if(kept==1) {
+        uint8_t *buffer=malloc(65536); if(!buffer) { close(fd);return -1; }
+        for(uint64_t offset=0;offset<first_size && !rc;) {
+            size_t amount=first_size-offset>65536?65536:(size_t)(first_size-offset);
+            if(!pread_full(fd,buffer,amount,first_offset+offset) || !pwrite_full(fd,buffer,amount,offset)) rc=-1;
+            offset+=amount;
+        }
+        free(buffer);
+        if(!rc && ftruncate(fd,(off_t)first_size)!=0) rc=-1;
+    } else {
+        // Retain the offsets and alignment of all 64-bit slices, including arm64e.
+        memset(entries+kept*entry_size,0,(count-kept)*entry_size);
+        header.nfat_arch=OSSwapHostToBigInt32(kept);
+        if(!pwrite_full(fd,entries,count*entry_size,sizeof header) || !pwrite_full(fd,&header,sizeof header,0)) rc=-1;
+    }
+    close(fd);
+    if(!rc) logf_(log,ctx,"  [ARCH] removed %u unsupported 32-bit slice(s); retained %u 64-bit slice(s)",count-kept,kept);
+    return rc;
+}
+
 int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, void *ctx) {
     fp_slice_t sl[FP_MAX_SLICES]; int n = 0; char err[256] = {0};
     if (fp_parse(in_path, sl, FP_MAX_SLICES, &n, err, sizeof err) != 0) { logf_(log, ctx, "  parse failed: %s", err); return -1; }
     bool any = false;
     for (int i = 0; i < n; i++) if (sl[i].has_enc && sl[i].cryptid) any = true;
     if (strcmp(in_path, out_path) != 0 && copy_file(in_path, out_path) != 0) { logf_(log, ctx, "  copy failed: %s", strerror(errno)); return -1; }
-    if (!any) return 1;
+    if (!any) return drop_32bit_slices(out_path, log, ctx) == 0 ? 1 : -1;
 
     int out = open(out_path, O_RDWR);
     if (out < 0) { logf_(log, ctx, "  open out: %s", strerror(errno)); return -1; }
@@ -429,5 +606,8 @@ int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, voi
         free(dec);
     }
     close(out);
+    if (rc == 0 && drop_32bit_slices(out_path, log, ctx) != 0) {
+        logf_(log, ctx, "  removing unsupported 32-bit slices failed"); rc = -1;
+    }
     return rc;
 }

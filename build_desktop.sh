@@ -41,7 +41,7 @@ info = {
     'CFBundleName': 'Unfairplayed', 'CFBundleDisplayName': 'Unfairplayed',
     'CFBundleIdentifier': 'dev.unfairplayed.desktop', 'CFBundleExecutable': 'Unfairplayed',
     'CFBundleIconFile': 'Unfairplayed.icns', 'CFBundlePackageType': 'APPL',
-    'CFBundleShortVersionString': '1.0', 'CFBundleVersion': '1',
+    'CFBundleShortVersionString': '1.0.1', 'CFBundleVersion': '2',
     'LSMinimumSystemVersion': '15.0', 'LSArchitecturePriority': ['arm64'],
     'NSHighResolutionCapable': True,
 }

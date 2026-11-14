@@ -38,6 +38,7 @@ typedef struct {
     uint32_t ret_before, ret_after;   // count of arm64 RET/PACIBSP words (code heuristic)
     double   ent_before, ent_after;   // Shannon entropy, bits/byte
     bool     data_only_layout;     // no encrypted instructions; bounded data/string/padding validation passed
+    bool     tail_call_layout;     // validated stack-restoring tail branch into an arm64 import stub
     double   ms;
 } fp_attempt_t;
 
